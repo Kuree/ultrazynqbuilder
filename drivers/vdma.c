@@ -5,7 +5,7 @@
  * Steven Bell <sebell@stanford.edu>
  * 15 December 2015, based on earlier work
  * Keyi Zhang <keyi@stanford.edu>
- * Updated the driver to support multiple cameras
+ * Updated the driver to support multiple cameras and DT
  */
 
 // TODO: some of these are probably unnecessary
@@ -19,6 +19,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/of_platform.h>
+#include <linux/radix-tree.h>
 
 #include "common.h"
 #include "buffer.h"
@@ -30,12 +31,10 @@ MODULE_LICENSE("GPL");
 #define DEVNAME "xilcam" // Shows up in /dev
 #define MAX_NUM_CAM 8 /* maximum number of cameras supported */
 
-#define VDMA_CONTROLLER_BASE 0x43000000
-#define VDMA_CONTROLLER_SIZE 0x100
-
 // Wait queue to pend on a frame finishing.  Threads waiting on this are
 // woken up each time a frame is finished and an interrupt occurs.
-DECLARE_WAIT_QUEUE_HEAD(wq_frame);
+// DECLARE_WAIT_QUEUE_HEAD(wq_frame);
+wait_queue_head_t wq_frame[MAX_NUM_CAM];
 
 atomic_t new_frame; // Whether we have a new (unread) output frame or not
 
@@ -45,50 +44,20 @@ struct cdev *chardev[MAX_NUM_CAM];
 struct device *vdma_dev[MAX_NUM_CAM];
 struct class *vdma_class;
 
-/* base the minor might not start from 0, we need a table
- * mapping minor to index
- */
-u32 minor_to_index[MAX_NUM_CAM];
-
 #define N_VDMA_BUFFERS 3 // Number of "live" buffers in the VDMA buffer ring
 Buffer* vdma_buf[MAX_NUM_CAM][N_VDMA_BUFFERS]; // Handles for buffers in the ring
 
 int debug_level = 3; // 0 is errors only, increasing numbers print more stuff
 
-// get device tree info
-static int parse_dt(struct platform_device *pdev,
-                    u32 *base,
-                    u32 *size,
-                    u32 *index)
-{
-  struct device_node *np;
-  int rc_base, rc_size, rc_index;
-
-  np = pdev->dev.of_node;
-
-  rc_base = of_property_read_u32(np, "controller_base", base);
-  rc_size = of_property_read_u32(np, "controller_size", size);
-  rc_index = of_property_read_u32(np, "controller_index", index);
-  if (rc_base || rc_size)
-    return -ENXIO;
-  else
-    return 0;
-}
-
-static inline int get_pdev_index(struct platform_device *pdev,
-                         u32 *index)
-{
-  return of_property_read_u32(pdev->dev.of_node, "controller_index", index);
-}
+/* radix tree to store pdev.id -> minor */
+RADIX_TREE(pdev_table, GFP_KERNEL);  /* Declare and initialize */
 
 static int dev_open(struct inode *inode, struct file *file)
 {
-  int i, minor;
-  u32 index;
+  int i, index;
   unsigned long status;
 
-  minor = iminor(file->f_path.dentry->d_inode);
-  index = minor_to_index[minor];
+  index = iminor(file->f_path.dentry->d_inode);
   // reset, so we can configure
   iowrite32(0x00010044, vdma_controller[index] + 0x30);
 
@@ -132,12 +101,11 @@ static int dev_open(struct inode *inode, struct file *file)
 
 static int dev_close(struct inode *inode, struct file *file)
 {
-  int i, minor;
+  int i;
   u32 index;
 
-  minor = iminor(file->f_path.dentry->d_inode);
-  index = minor_to_index[minor];
-  DEBUG("obtained minor: %d index: %d from inode\n", minor, index);
+  index = iminor(file->f_path.dentry->d_inode);
+  DEBUG("obtained minor (index): %d from inode\n", index);
 
   // Stop, so we can configure
   iowrite32(0x00010040, vdma_controller[index] + 0x30);
@@ -158,7 +126,7 @@ int grab_image(Buffer* buf, u32 index)
   //unsigned long status; // For printing debug messages
 
   // Wait until there's a new image
-  wait_event_interruptible(wq_frame, atomic_read(&new_frame) == 1);
+  wait_event_interruptible(wq_frame[index], atomic_read(&new_frame) == 1);
   atomic_set(&new_frame, 0); // Mark the image as read
 
   // Allocate a new buffer to swap in
@@ -214,12 +182,10 @@ long dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
   Buffer tmp;
   u32 index;
-  int minor;
 
   /* get minor from filep */
-  minor = iminor(filp->f_path.dentry->d_inode);
-  index = minor_to_index[minor];
-  DEBUG("obtained minor : %d index: %d from filep\n", minor, index);
+  index = iminor(filp->f_path.dentry->d_inode);
+  DEBUG("obtained minor (index): %d from filep\n", index);
 
   switch(cmd){
     case GRAB_IMAGE:
@@ -256,7 +222,9 @@ struct file_operations fops = {
 irqreturn_t frame_finished_handler(int irq, void* dev_id)
 {
   u32 index;
-  get_pdev_index((struct platform_device*)dev_id, &index);
+
+  index = MINOR(*(dev_t*)dev_id);
+  DEBUG("Using minor (index): %d from dev: %llx\n", index, dev_id);
 
   // Acknowledge/clear interrupt
   iowrite32(0x00001000, vdma_controller[index] + 0x34);
@@ -266,35 +234,43 @@ irqreturn_t frame_finished_handler(int irq, void* dev_id)
   // TODO: get the current time and save it somewhere
   // Should be able to use do_gettimeofday()
   atomic_set(&new_frame, 1);
-  wake_up_interruptible(&wq_frame);
+  wake_up_interruptible(&wq_frame[index]);
   DEBUG("irq: VDMA frame finished.\n");
   return(IRQ_HANDLED);
 }
 
 static int vdma_probe(struct platform_device *pdev)
 {
-  int irqok;
-  u32 base, size, index;
-  struct resource* r_irq = NULL;
+  int irqok, index, irq;
+  struct resource *mem = NULL;
   dev_t curr_dev;
-
-  /* get the camera index and controller info from device tree */
-  parse_dt(pdev, &base, &size, &index);
-
-  // Register the IRQ
-  r_irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-  if(r_irq == NULL){
-    ERROR("IRQ lookup failed.  Check the device tree.\n");
-  }
-  TRACE("IRQ number is %lld\n", r_irq->start);
-  /* passing pdev address as a device cookie */
-  irqok = request_irq(r_irq->start, frame_finished_handler, 0, CLASSNAME, pdev);
 
   // Get character device numbers up to NUM_CAM
   alloc_chrdev_region(&curr_dev, 0, 1, DEVNAME);
   DEBUG("VDMA device registered with major %d, minor: %d\n",
         MAJOR(curr_dev), MINOR(curr_dev));
+
+  /* use minor as an index
+   * assuming the minor starts from 0.
+   */
+  index = MINOR(curr_dev);
   device_num[index] = curr_dev;
+
+  // Register the IRQ
+  irq = platform_get_irq(pdev, 0);
+  if (irq < 0) {
+    ERROR("IRQ lookup failed.  Check the device tree.\n");
+  }
+  TRACE("IRQ number is %d\n", irq);
+  /* passing pdev address as a device cookie */
+  irqok = request_irq(irq, frame_finished_handler, 0, CLASSNAME,
+                      &device_num[index]);
+
+  /* manually set up the wait queue because macro doesn't allow
+   * array index
+   */
+  DECLARE_WAIT_QUEUE_HEAD(wq);
+  wq_frame[index] = wq; /* memory copy */
 
   // Register the driver with the kernel
   chardev[index] = cdev_alloc();
@@ -303,14 +279,16 @@ static int vdma_probe(struct platform_device *pdev)
   /* add the device to the core */
   cdev_add(chardev[index], device_num[index], 1);
 
-  /* add minor->index table entry */
-  minor_to_index[MINOR(curr_dev)] = index;
-
   /* set up vdma controller */
-  vdma_controller[index] = ioremap(base, size);
+  mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+  vdma_controller[index] = devm_ioremap_resource(&pdev->dev, mem);
+
   if(vdma_controller[index] == NULL){
     return(-ENODEV);
   }
+
+  /* add the device to the table */
+  radix_tree_insert(&pdev_table, pdev->id, (void *)(long)index);
 
   /* create a device node in /dev/ */
   device_create(vdma_class,
@@ -325,17 +303,19 @@ static int vdma_probe(struct platform_device *pdev)
 
 static int vdma_remove(struct platform_device *pdev)
 {
-  struct resource* r_irq = NULL;
-  u32 index;
+  int irq;
+  uintptr_t index;
 
-  /* get index from the DT */
-  get_pdev_index(pdev, &index);
+  /* get minor from pdev id and then remove the entry */
+  index = (uintptr_t)radix_tree_lookup(&pdev_table, pdev->id);
+  radix_tree_delete(&pdev_table, pdev->id);
+
   // Release the IRQ line
-  r_irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-  if(r_irq == NULL){
+  irq = platform_get_irq(pdev, 0);
+  if (irq < 0) {
     ERROR("IRQ lookup failed on release.  Check the device tree.\n");
   }
-  free_irq(r_irq->start, NULL);
+  free_irq(irq, NULL);
 
   device_unregister(vdma_dev[index]);
   cdev_del(chardev[index]);
