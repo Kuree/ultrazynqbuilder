@@ -19,7 +19,6 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/of_platform.h>
-#include <linux/radix-tree.h>
 
 #include "common.h"
 #include "buffer.h"
@@ -29,71 +28,81 @@ MODULE_LICENSE("GPL");
 
 #define CLASSNAME "xilcam" // Shows up in /sys/class
 #define DEVNAME "xilcam" // Shows up in /dev
-#define MAX_NUM_CAM 8 /* maximum number of cameras supported */
-
-// Wait queue to pend on a frame finishing.  Threads waiting on this are
-// woken up each time a frame is finished and an interrupt occurs.
-// DECLARE_WAIT_QUEUE_HEAD(wq_frame);
-wait_queue_head_t wq_frame[MAX_NUM_CAM];
-
-atomic_t new_frame; // Whether we have a new (unread) output frame or not
-
-unsigned char* vdma_controller[MAX_NUM_CAM];
-dev_t device_num[MAX_NUM_CAM];
-struct cdev *chardev[MAX_NUM_CAM];
-struct device *vdma_dev[MAX_NUM_CAM];
-struct class *vdma_class;
 
 #define N_VDMA_BUFFERS 3 // Number of "live" buffers in the VDMA buffer ring
-Buffer* vdma_buf[MAX_NUM_CAM][N_VDMA_BUFFERS]; // Handles for buffers in the ring
+
+/* drvdata to hold all info */
+struct xilcam_drvdata {
+   struct device *dev;
+   struct cdev cdev;
+   dev_t devt;
+
+   /* control info */
+   /* Wait queue to pend on a frame finishing. Threads waiting on this are
+    * woken up each time a frame is finished and an interrupt occurs.
+    */
+   wait_queue_head_t wq_frame;
+   /* Whether we have a new (unread) output frame or not */
+   atomic_t new_frame;
+   /* Handles for buffers in the ring */
+   Buffer *vdma_buf[N_VDMA_BUFFERS];
+   unsigned char *vdma_controller;
+};
+
+struct class *vdma_class;
 
 int debug_level = 3; // 0 is errors only, increasing numbers print more stuff
 
-/* radix tree to store pdev.id -> minor */
-RADIX_TREE(pdev_table, GFP_KERNEL);  /* Declare and initialize */
-
 static int dev_open(struct inode *inode, struct file *file)
 {
-  int i, index;
+  int i;
   unsigned long status;
+  unsigned char *vdma_controller;
+  Buffer **vdma_buf;
+  struct xilcam_drvdata *drvdata;
 
-  index = iminor(file->f_path.dentry->d_inode);
+  /* get the drvdata from container */
+  drvdata = container_of(inode->i_cdev, struct xilcam_drvdata, cdev);
+  file->private_data = drvdata;
+  vdma_controller = drvdata->vdma_controller;
+  vdma_buf = drvdata->vdma_buf;
+
   // reset, so we can configure
-  iowrite32(0x00010044, vdma_controller[index] + 0x30);
+  iowrite32(0x00010044, vdma_controller + 0x30);
 
   // Acquire buffers and hand them to the VDMA engine
-  for(i = 0; i < N_VDMA_BUFFERS; i++){
-    vdma_buf[index][i] = acquire_buffer(1920, 1080, 1, 2048);
-    if(vdma_buf[index][i] == NULL){
+  for (i = 0; i < N_VDMA_BUFFERS; i++) {
+    vdma_buf[i] = acquire_buffer(1920, 1080, 1, 2048);
+    if (vdma_buf[i] == NULL) {
       return(-ENOMEM);
     }
-    iowrite32(vdma_buf[index][i]->phys_addr,
-              vdma_controller[index] + 0xac + i*4);
+    iowrite32(vdma_buf[i]->phys_addr,
+              vdma_controller + 0xac + i*4);
   }
   // Set number of buffers
-  iowrite32(N_VDMA_BUFFERS, vdma_controller[index] + 0x48);
+  iowrite32(N_VDMA_BUFFERS, vdma_controller + 0x48);
 
-  status = ioread32(vdma_controller[index] + 0x34);
+  status = ioread32(vdma_controller + 0x34);
   DEBUG("dev_open: ioread32 at offset 0x34 returned %08lx\n", status);
-  iowrite32(0xffffffff, vdma_controller[index] + 0x34); // clear errors
+  iowrite32(0xffffffff, vdma_controller + 0x34); // clear errors
   DEBUG("dev_open: iowrite32 at offset 0x34 with %08x\n", 0xffffffff);
-  status = ioread32(vdma_controller[index] + 0x34);
+  status = ioread32(vdma_controller + 0x34);
   DEBUG("dev_open: ioread32 at offset 0x34 returned %08lx\n", status);
 
   // Run in circular mode, and turn on only the frame complete interrupt
-  iowrite32(0x00011043, vdma_controller[index] + 0x30);
-  status = ioread32(vdma_controller[index] + 0x30);
+  iowrite32(0x00011043, vdma_controller + 0x30);
+  status = ioread32(vdma_controller + 0x30);
   DEBUG("dev_open: ioread32 at offset 0x30 returned %08lx\n", status);
-  status = ioread32(vdma_controller[index] + 0x34);
+  status = ioread32(vdma_controller + 0x34);
   DEBUG("dev_open: ioread32 at offset 0x34 returned %08lx\n", status);
 
   // Write the size.  This also commits the settings and begins transfer
   // Horizontal size (1 byte/pixel)
-  iowrite32(1920, vdma_controller[index] + 0xa4);
+  iowrite32(1920, vdma_controller + 0xa4);
   // Stride (1 byte/pixel)
-  iowrite32(2048, vdma_controller[index] + 0xa8);
+  iowrite32(2048, vdma_controller + 0xa8);
   // Vertical size, start transfer
-  iowrite32(1080, vdma_controller[index] + 0xa0);
+  iowrite32(1080, vdma_controller + 0xa0);
 
   TRACE("dev_open: Started VDMA\n");
   return(0);
@@ -102,16 +111,19 @@ static int dev_open(struct inode *inode, struct file *file)
 static int dev_close(struct inode *inode, struct file *file)
 {
   int i;
-  u32 index;
+  unsigned char *vdma_controller;
+  Buffer **vdma_buf;
+  struct xilcam_drvdata *drvdata;
 
-  index = iminor(file->f_path.dentry->d_inode);
-  DEBUG("obtained minor (index): %d from inode\n", index);
+  drvdata = file->private_data;
+  vdma_controller = drvdata->vdma_controller;
+  vdma_buf = drvdata->vdma_buf;
 
   // Stop, so we can configure
-  iowrite32(0x00010040, vdma_controller[index] + 0x30);
+  iowrite32(0x00010040, vdma_controller + 0x30);
   // Free our collection of big buffers
-  for(i = 0; i < N_VDMA_BUFFERS; i++){
-    release_buffer(vdma_buf[index][i]);
+  for (i = 0; i < N_VDMA_BUFFERS; i++) {
+    release_buffer(vdma_buf[i]);
   }
 
   TRACE("dev_close: Stopped VDMA\n");
@@ -119,28 +131,30 @@ static int dev_close(struct inode *inode, struct file *file)
 }
 
 
-int grab_image(Buffer* buf, u32 index)
+int grab_image(Buffer* buf, struct xilcam_drvdata *drvdata)
 {
   Buffer* tmp;
   unsigned long slot; // Slot VDMA S2MM is working on
   //unsigned long status; // For printing debug messages
 
+
   // Wait until there's a new image
-  wait_event_interruptible(wq_frame[index], atomic_read(&new_frame) == 1);
-  atomic_set(&new_frame, 0); // Mark the image as read
+  wait_event_interruptible(drvdata->wq_frame,
+                           atomic_read(&drvdata->new_frame) == 1);
+  atomic_set(&drvdata->new_frame, 0); // Mark the image as read
 
   // Allocate a new buffer to swap in
   tmp = acquire_buffer(1920, 1080, 1, 2048);
 
   // If this fails, return failure
-  if(tmp == NULL){
+  if (tmp == NULL) {
     return(-ENOBUFS);
   }
 
   // Grab the most recently completed image
   // The current frame store location is in 0x24 (FRMPTR_STS), bits 20-16
   // Note 0x24 (FRMPTR_STS) is only available if C_ENABLE_DEBUG_INFO_12=1
-  slot = ioread32(vdma_controller[index] + 0x24);
+  slot = ioread32(drvdata->vdma_controller + 0x24);
   DEBUG("grab_image: ioread32 at offset 0x24 returned %08lx\n", slot);
   slot = (slot & 0x001F0000) >> 16;
   /*
@@ -160,20 +174,20 @@ int grab_image(Buffer* buf, u32 index)
   DEBUG("grab_image: most recently finished frame in slot %lu\n", slot);
 
   // Copy the buffer object for the caller
-  *buf = *vdma_buf[index][slot];
+  *buf = *drvdata->vdma_buf[slot];
 
   // Replace it with the new buffer
-  vdma_buf[index][slot] = tmp;
+  drvdata->vdma_buf[slot] = tmp;
 
   // Write the change to the VDMA engine
-  iowrite32(vdma_buf[index][slot]->phys_addr,
-            vdma_controller[index] + 0xac + slot*4);
+  iowrite32(drvdata->vdma_buf[slot]->phys_addr,
+            drvdata->vdma_controller + 0xac + slot*4);
 
   // Write the vertical size again so the settings take effect
-  iowrite32(1080, vdma_controller[index] + 0xa0);
+  iowrite32(1080, drvdata->vdma_controller + 0xa0);
 
   TRACE("grab_image: replaced %d with %d\n", buf->id,
-        vdma_buf[index][slot]->id);
+        drvdata->vdma_buf[slot]->id);
   return(0);
 }
 
@@ -181,16 +195,14 @@ int grab_image(Buffer* buf, u32 index)
 long dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
   Buffer tmp;
-  u32 index;
+  struct xilcam_drvdata *drvdata;
 
-  /* get minor from filep */
-  index = iminor(filp->f_path.dentry->d_inode);
-  DEBUG("obtained minor (index): %d from filep\n", index);
+  drvdata = filp->private_data;
 
   switch(cmd){
     case GRAB_IMAGE:
       TRACE("ioctl: GRAB_IMAGE\n");
-      if(grab_image(&tmp, index) == 0 &&
+      if(grab_image(&tmp, drvdata) == 0 &&
         access_ok(VERIFY_WRITE, (void*)arg, sizeof(Buffer)))
       {
         TRACE("Copying raw buffer object to user\n");
@@ -221,107 +233,142 @@ struct file_operations fops = {
 // Interrupt handler for when a frame finishes
 irqreturn_t frame_finished_handler(int irq, void* dev_id)
 {
-  u32 index;
+  struct xilcam_drvdata *drvdata;
 
-  index = MINOR(*(dev_t*)dev_id);
-  DEBUG("Using minor (index): %d from dev: %llx\n", index, dev_id);
+  drvdata = dev_id;
 
   // Acknowledge/clear interrupt
-  iowrite32(0x00001000, vdma_controller[index] + 0x34);
+  iowrite32(0x00001000, drvdata->vdma_controller + 0x34);
   // TODO: reset the frame count back to 1?
   //e.g., iowrite32(0x00011043, vdma_controller + 0x30);
 
   // TODO: get the current time and save it somewhere
   // Should be able to use do_gettimeofday()
-  atomic_set(&new_frame, 1);
-  wake_up_interruptible(&wq_frame[index]);
+  atomic_set(&drvdata->new_frame, 1);
+  wake_up_interruptible(&drvdata->wq_frame);
   DEBUG("irq: VDMA frame finished.\n");
   return(IRQ_HANDLED);
 }
 
 static int vdma_probe(struct platform_device *pdev)
 {
-  int irqok, index, irq;
-  struct resource *mem = NULL;
-  dev_t curr_dev;
+  int irqok, irq, retval;
+  struct resource *mem;
+  dev_t devt;
+  struct device *dev;
+  struct xilcam_drvdata *drvdata;
+  DECLARE_WAIT_QUEUE_HEAD(wq);
+
+  dev = &pdev->dev;
 
   // Get character device numbers up to NUM_CAM
-  alloc_chrdev_region(&curr_dev, 0, 1, DEVNAME);
+  alloc_chrdev_region(&devt, 0, 1, DEVNAME);
   DEBUG("VDMA device registered with major %d, minor: %d\n",
-        MAJOR(curr_dev), MINOR(curr_dev));
+        MAJOR(devt), MINOR(devt));
 
-  /* use minor as an index
-   * assuming the minor starts from 0.
-   */
-  index = MINOR(curr_dev);
-  device_num[index] = curr_dev;
+  /* set up drvdata */
+  drvdata = kzalloc(sizeof(struct xilcam_drvdata), GFP_KERNEL);
+  if (!drvdata) {
+    dev_err(dev, "Couldn't allocate device private record\n");
+    retval = -ENOMEM;
+    goto failed0;
+  }
+  dev_set_drvdata(dev, (void *)drvdata);
 
   // Register the IRQ
   irq = platform_get_irq(pdev, 0);
-  if (irq < 0) {
-    ERROR("IRQ lookup failed.  Check the device tree.\n");
-  }
   TRACE("IRQ number is %d\n", irq);
-  /* passing pdev address as a device cookie */
+  if (irq < 0) {
+    dev_err(dev, "IRQ lookup failed.  Check the device tree.\n");
+    retval = -ENODEV;
+    goto failed1;
+  }
+
+  /* passing drvdata as a device cookie */
   irqok = request_irq(irq, frame_finished_handler, 0, CLASSNAME,
-                      &device_num[index]);
+                     (void *)drvdata);
+  if (irqok < 0) {
+    dev_err(dev, "Couldn't request IRQ for the device\n");
+    retval = -ENODEV;
+    goto failed1;
+  }
 
-  /* manually set up the wait queue because macro doesn't allow
-   * array index
-   */
-  DECLARE_WAIT_QUEUE_HEAD(wq);
-  wq_frame[index] = wq; /* memory copy */
-
-  // Register the driver with the kernel
-  chardev[index] = cdev_alloc();
-  chardev[index]->ops = &fops;
-
-  /* add the device to the core */
-  cdev_add(chardev[index], device_num[index], 1);
+  drvdata->devt = devt;
+  drvdata->dev = dev;
 
   /* set up vdma controller */
   mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-  vdma_controller[index] = devm_ioremap_resource(&pdev->dev, mem);
-
-  if(vdma_controller[index] == NULL){
-    return(-ENODEV);
+  if (!mem) {
+    dev_err(dev, "Could't get memory information. Check the device tree.\n");
+    retval = -ENODEV;
+    goto failed1;
   }
 
-  /* add the device to the table */
-  radix_tree_insert(&pdev_table, pdev->id, (void *)(long)index);
+  drvdata->vdma_controller = devm_ioremap_resource(&pdev->dev, mem);
+
+  if(!drvdata->vdma_controller){
+    dev_err(dev, "ioremap() failed.\n");
+    retval = -ENODEV;
+    goto failed1;
+  }
+
+  drvdata->wq_frame = wq; /* memory copy */
+
+  // Register the driver with the kernel
+  cdev_init(&drvdata->cdev, &fops);
+  drvdata->cdev.owner = THIS_MODULE;
+  /* add the device to the core */
+  retval = cdev_add(&drvdata->cdev, devt, 1);
+
+  if (retval) {
+    dev_err(dev, "cdev_add() failed\n");
+    goto failed1;
+  }
 
   /* create a device node in /dev/ */
+  // TODO: fix the count using atomic counter
   device_create(vdma_class,
-                NULL,         /* no parent device */
-                curr_dev,
+                dev,         /* pdev as parrent device */
+                devt,
                 NULL,         /* no additional data */
-                DEVNAME "%d", index);
+                DEVNAME "%d", MINOR(devt));
 
   DEBUG("VDMA driver initialized\n");
   return(0);
+
+failed1:
+  iounmap(drvdata->vdma_controller);
+
+failed0:
+  kfree(drvdata);
+
+  return retval;
 }
 
 static int vdma_remove(struct platform_device *pdev)
 {
   int irq;
-  uintptr_t index;
+  struct xilcam_drvdata *drvdata;
 
-  /* get minor from pdev id and then remove the entry */
-  index = (uintptr_t)radix_tree_lookup(&pdev_table, pdev->id);
-  radix_tree_delete(&pdev_table, pdev->id);
+  drvdata = (struct xilcam_drvdata*)dev_get_drvdata(&pdev->dev);
+
+  if (!drvdata)
+    return 0;
 
   // Release the IRQ line
   irq = platform_get_irq(pdev, 0);
   if (irq < 0) {
     ERROR("IRQ lookup failed on release.  Check the device tree.\n");
+  } else {
+    free_irq(irq, NULL);
   }
-  free_irq(irq, NULL);
 
-  device_unregister(vdma_dev[index]);
-  cdev_del(chardev[index]);
-  unregister_chrdev_region(device_num[index], 1);
+  device_unregister(drvdata->dev);
+  cdev_del(&drvdata->cdev);
+  unregister_chrdev_region(drvdata->devt, 1);
 
-  iounmap(vdma_controller[index]);
+  iounmap(drvdata->vdma_controller);
+
   return(0);
 }
 

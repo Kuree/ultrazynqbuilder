@@ -45,7 +45,7 @@ int init_buffers(struct device* dev)
   of_dma_configure(dev, NULL);
 
   DEBUG("Required mask is 0x%llx\n", dma_get_required_mask(dev));
-  DEBUG("Current mask is 0x%llx\n", dev->dma_mask);
+  DEBUG("Current mask is 0x%p\n", dev->dma_mask);
   DEBUG("Current coherent mask is 0x%llx\n", dev->coherent_dma_mask);
 
   // Allocate a huge chunk of memory

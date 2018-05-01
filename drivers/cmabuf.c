@@ -34,11 +34,11 @@ const int debug_level = 4;
 // at a time
 static int dev_open(struct inode *inode, struct file *file)
 {
+  struct cmabuf_drvdata *drvdata;
   TRACE("cmabuffer: dev_open\n");
 
-  struct cmabuf_drvdata *drvdata;
   drvdata = container_of(inode->i_cdev, struct cmabuf_drvdata, cdev);
- 
+
   /* set private data */
   file->private_data = drvdata;
 
@@ -52,8 +52,8 @@ static int dev_open(struct inode *inode, struct file *file)
 
 static int dev_close(struct inode *inode, struct file *file)
 {
-  TRACE("cmabuffer: dev_close\n");
   struct cmabuf_drvdata *drvdata;
+  TRACE("cmabuffer: dev_close\n");
 
   drvdata = file->private_data;
   cleanup_buffers(drvdata->dev); // Release all the buffer memory
@@ -214,7 +214,10 @@ static void cmabuf_driver_exit(void)
   for (i = 0; i < NUM_DEV; i++) {
     drvdata = cmabuf_drvdata[i];
     device_unregister(drvdata->dev);
-    cdev_del(&drvdata->dev);
+    cdev_del(&drvdata->cdev);
+
+    /* free kernel memory */
+    kfree(drvdata);
   }
   unregister_chrdev_region(device_num, NUM_DEV);
   class_destroy(cmabuf_class);
