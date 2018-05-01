@@ -4,6 +4,7 @@
 #include <asm/uaccess.h> // Copy to/from userspace pointers
 #include <linux/mm.h>
 #include <linux/pagemap.h>
+#include <linux/slab.h>
 
 MODULE_LICENSE("GPL");
 
@@ -12,22 +13,37 @@ MODULE_LICENSE("GPL");
 #include "ioctl_cmds.h"
 
 #define CLASSNAME "cmabuffer" // Shows up in /sys/class
-#define DEVNAME "cmabuffer0" // Shows up in /dev
+#define DEVNAME "cmabuffer" // Shows up in /dev
+#define NUM_DEV 8 // in total 8 cma buffers
+
+/* meta data for the driver */
+struct cmabuf_drvdata {
+  struct device *dev;
+  struct cdev cdev; /* Char device structure */
+  dev_t devt;
+};
 
 dev_t device_num;
-struct cdev *chardev;
-struct device *cmabuf_dev;
+struct cmabuf_drvdata *cmabuf_drvdata[NUM_DEV];
 struct class *cmabuf_class;
 
-const int debug_level = 4; // 0 is errors only, increasing numbers print more stuff
+// 0 is errors only, increasing numbers print more stuff
+const int debug_level = 4;
 
-// TODO: allow the file handle to be opened multiple times, and access
-// the same pool of memory?
+// TODO: need to make sure the device can only be accessed one
+// at a time
 static int dev_open(struct inode *inode, struct file *file)
 {
   TRACE("cmabuffer: dev_open\n");
+
+  struct cmabuf_drvdata *drvdata;
+  drvdata = container_of(inode->i_cdev, struct cmabuf_drvdata, cdev);
+ 
+  /* set private data */
+  file->private_data = drvdata;
+
   // Set up the image buffers; fail if it fails.
-  if(init_buffers(cmabuf_dev) < 0){
+  if(init_buffers(drvdata->dev) < 0){
     return(-ENOMEM);
   }
 
@@ -37,7 +53,10 @@ static int dev_open(struct inode *inode, struct file *file)
 static int dev_close(struct inode *inode, struct file *file)
 {
   TRACE("cmabuffer: dev_close\n");
-  cleanup_buffers(cmabuf_dev); // Release all the buffer memory
+  struct cmabuf_drvdata *drvdata;
+
+  drvdata = file->private_data;
+  cleanup_buffers(drvdata->dev); // Release all the buffer memory
 
   return(0);
 }
@@ -139,9 +158,15 @@ struct file_operations fops = {
 
 static int cmabuf_driver_init(void)
 {
+  u64 i; /* not portable to 32-bit system */
+  dev_t curr_dev;
+  struct cmabuf_drvdata *drvdata;
+  struct device *dev;
+
   // Get a single character device number
-  alloc_chrdev_region(&device_num, 0, 1, DEVNAME);
-  DEBUG("Device registered with major %d, minor: %d\n", MAJOR(device_num), MINOR(device_num));
+  alloc_chrdev_region(&device_num, 0, NUM_DEV, DEVNAME);
+  DEBUG("Device registered with major %d, minor: %d\n", MAJOR(device_num),
+        MINOR(device_num));
 
   // Set up the device and class structures so we show up in sysfs,
   // and so we have a device we can hand to the DMA request
@@ -150,13 +175,32 @@ static int cmabuf_driver_init(void)
   // If we had multiple devices, we could break it apart with
   // MAJOR(device_num), and then add in our own minor number, with
   // MKDEV(MAJOR(device_num), minor_num)
-  cmabuf_dev = device_create(cmabuf_class, NULL, device_num, 0, DEVNAME);
+  for (i = 0; i < NUM_DEV; i++) {
+    curr_dev = MKDEV(MAJOR(device_num), MINOR(device_num) + i);
 
-  // Register the driver with the kernel
-  chardev = cdev_alloc();
-  chardev->ops = &fops;
-  cdev_add(chardev, device_num, 1);
+    /* allocate and set the drv data */
+    drvdata = kzalloc(sizeof(struct cmabuf_drvdata), GFP_KERNEL);
+    if (!drvdata) {
+      ERROR("Couldn't allocate device private data\n");
+      return -ENOMEM;
+    }
+    drvdata->devt = curr_dev;
 
+    // Register the driver with the kernel
+    cdev_init(&drvdata->cdev, &fops);
+    drvdata->cdev.owner = THIS_MODULE;
+    cdev_add(&drvdata->cdev, curr_dev, 1);
+
+    dev = device_create(cmabuf_class,
+                        NULL,         /* no parent device */
+                        curr_dev,
+                        NULL,         /* pass nothing */
+                        DEVNAME "%lld", i);
+    dev_set_drvdata(dev, (void *)drvdata);
+
+    /* store the drv data for cleaning up */
+    cmabuf_drvdata[i] = drvdata;
+  }
   DEBUG("Driver initialized\n");
 
   return(0);
@@ -164,11 +208,16 @@ static int cmabuf_driver_init(void)
 
 static void cmabuf_driver_exit(void)
 {
-  device_unregister(cmabuf_dev);
-  class_destroy(cmabuf_class);
-  cdev_del(chardev);
-  unregister_chrdev_region(device_num, 1);
+  int i;
+  struct cmabuf_drvdata *drvdata;
 
+  for (i = 0; i < NUM_DEV; i++) {
+    drvdata = cmabuf_drvdata[i];
+    device_unregister(drvdata->dev);
+    cdev_del(&drvdata->dev);
+  }
+  unregister_chrdev_region(device_num, NUM_DEV);
+  class_destroy(cmabuf_class);
 }
 
 module_init(cmabuf_driver_init);
