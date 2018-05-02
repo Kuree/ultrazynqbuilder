@@ -19,6 +19,7 @@
 #include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/of_platform.h>
+#include <linux/mutex.h>    /* for mutex */
 
 #include "common.h"
 #include "buffer.h"
@@ -31,11 +32,17 @@ MODULE_LICENSE("GPL");
 
 #define N_VDMA_BUFFERS 3 // Number of "live" buffers in the VDMA buffer ring
 
+#define XILCAM_MAJOR 243
+#define XILCAM_MINOR 0
+#define XILCAM_DEVICES 4 // up to four cameras?
+static bool probed_devices[XILCAM_DEVICES];
+
 /* drvdata to hold all info */
 struct xilcam_drvdata {
    struct device *dev;
    struct cdev cdev;
    dev_t devt;
+   struct device *child_dev;
 
    /* control info */
    /* Wait queue to pend on a frame finishing. Threads waiting on this are
@@ -47,9 +54,14 @@ struct xilcam_drvdata {
    /* Handles for buffers in the ring */
    Buffer *vdma_buf[N_VDMA_BUFFERS];
    unsigned char *vdma_controller;
+   int irq;
 };
 
 struct class *vdma_class;
+
+static u32 dev_counter = 0;
+DEFINE_MUTEX(dev_counter_lock);
+DEFINE_MUTEX(xilcam_sem);
 
 int debug_level = 3; // 0 is errors only, increasing numbers print more stuff
 
@@ -228,6 +240,7 @@ struct file_operations fops = {
   .open = dev_open,
   .release = dev_close,
   .unlocked_ioctl = dev_ioctl,
+  .owner = THIS_MODULE,
 };
 
 // Interrupt handler for when a frame finishes
@@ -252,7 +265,7 @@ irqreturn_t frame_finished_handler(int irq, void* dev_id)
 
 static int vdma_probe(struct platform_device *pdev)
 {
-  int irqok, irq, retval;
+  int irqok, irq = -1, retval, id = pdev->id;
   struct resource *mem;
   dev_t devt;
   struct device *dev;
@@ -261,10 +274,31 @@ static int vdma_probe(struct platform_device *pdev)
 
   dev = &pdev->dev;
 
-  // Get character device numbers up to NUM_CAM
-  alloc_chrdev_region(&devt, 0, 1, DEVNAME);
-  DEBUG("VDMA device registered with major %d, minor: %d\n",
-        MAJOR(devt), MINOR(devt));
+  mutex_lock(&xilcam_sem);
+
+  if (id < 0) {
+    for (id = 0; id < XILCAM_DEVICES; id++)
+      if (!probed_devices[id])
+        break;
+  }
+
+  if (id >= XILCAM_DEVICES) {
+    mutex_unlock(&xilcam_sem);
+    dev_err(dev, "id too large: %d\n", id);
+    return -EINVAL;
+  }
+
+  if (probed_devices[id]) {
+    mutex_unlock(&xilcam_sem);
+    dev_err(dev, "cannot assign to %d; it's already in use.\n", id);
+    return -EBUSY;
+  }
+
+  probed_devices[id] = 1;
+  mutex_unlock(&xilcam_sem);
+
+  devt = MKDEV(XILCAM_MAJOR, XILCAM_MINOR + id);
+  DEBUG("dev registered with major: %d minor: %d\n", XILCAM_MAJOR, id);
 
   /* set up drvdata */
   drvdata = kzalloc(sizeof(struct xilcam_drvdata), GFP_KERNEL);
@@ -295,6 +329,7 @@ static int vdma_probe(struct platform_device *pdev)
 
   drvdata->devt = devt;
   drvdata->dev = dev;
+  drvdata->irq = irq;
 
   /* set up vdma controller */
   mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -322,25 +357,38 @@ static int vdma_probe(struct platform_device *pdev)
 
   if (retval) {
     dev_err(dev, "cdev_add() failed\n");
-    goto failed1;
+    goto failed2;
   }
 
   /* create a device node in /dev/ */
   // TODO: fix the count using atomic counter
-  device_create(vdma_class,
-                dev,         /* pdev as parrent device */
-                devt,
-                NULL,         /* no additional data */
-                DEVNAME "%d", MINOR(devt));
+  drvdata->child_dev = device_create(vdma_class,
+                                     NULL,         /* pdev as parrent device */
+                                     devt,
+                                     NULL,         /* no additional data */
+                                     DEVNAME "%d", dev_counter);
+
+  mutex_lock(&dev_counter_lock);
+  ++dev_counter;
+  mutex_unlock(&dev_counter_lock);
+
+  if (IS_ERR(drvdata->child_dev)) {
+    dev_err(dev, "device_create() failed\n");
+  }
 
   DEBUG("VDMA driver initialized\n");
   return(0);
 
-failed1:
+failed2:
   iounmap(drvdata->vdma_controller);
 
-failed0:
+failed1:
   kfree(drvdata);
+
+failed0:
+  mutex_lock(&xilcam_sem);
+  probed_devices[id] = 0;
+  mutex_unlock(&xilcam_sem);
 
   return retval;
 }
@@ -349,25 +397,32 @@ static int vdma_remove(struct platform_device *pdev)
 {
   int irq;
   struct xilcam_drvdata *drvdata;
+  struct device *dev = &pdev->dev;
 
-  drvdata = (struct xilcam_drvdata*)dev_get_drvdata(&pdev->dev);
+  drvdata = (struct xilcam_drvdata*)dev_get_drvdata(dev);
 
   if (!drvdata)
     return 0;
 
   // Release the IRQ line
-  irq = platform_get_irq(pdev, 0);
-  if (irq < 0) {
-    ERROR("IRQ lookup failed on release.  Check the device tree.\n");
-  } else {
-    free_irq(irq, NULL);
-  }
+  irq = drvdata->irq;
+  if (irq >= 0)
+    free_irq(irq, drvdata);
 
-  device_unregister(drvdata->dev);
+  DEBUG("vdma_class %p\n", drvdata->child_dev);
+  //device_destroy(vdma_class, drvdata->devt);
+  //device_unregister(drvdata->child_dev);
+  //DEBUG("device destroyed\n");
   cdev_del(&drvdata->cdev);
-  unregister_chrdev_region(drvdata->devt, 1);
 
   iounmap(drvdata->vdma_controller);
+
+  kfree(drvdata);
+  dev_set_drvdata(dev, NULL);
+
+  mutex_lock(&xilcam_sem);
+  probed_devices[MINOR(dev->devt)-XILCAM_MINOR] = 0;
+  mutex_unlock(&xilcam_sem);
 
   return(0);
 }
@@ -389,17 +444,44 @@ static struct platform_driver vdma_driver = {
 /* register device class and other init */
 static int __init vdma_init(void)
 {
+  int retval;
+  dev_t devt;
+
+  devt = MKDEV(XILCAM_MAJOR, XILCAM_MINOR);
+
   // Set up the device and class structures so we show up in sysfs,
   // and so we have a device we can hand to the DMA request
   vdma_class = class_create(THIS_MODULE, CLASSNAME);
-  return platform_driver_register(&vdma_driver);
+
+  /* request a range of devices */
+  retval = register_chrdev_region(devt,
+                                  XILCAM_DEVICES,
+                                  DEVNAME);
+
+  if (retval < 0)
+    return retval;
+
+  retval = platform_driver_register(&vdma_driver);
+
+  if (retval)
+    goto failed0;
+
+  return 0;
+
+failed0:
+  unregister_chrdev_region(devt, XILCAM_DEVICES);
+  return retval;
 }
 
 /* clean up the device class */
 static void __exit vdma_exit(void)
 {
+  dev_t devt = MKDEV(XILCAM_MAJOR, XILCAM_MINOR);
+
   class_destroy(vdma_class);
   platform_driver_unregister(&vdma_driver);
+
+  unregister_chrdev_region(devt, XILCAM_DEVICES);
 }
 
 /* because we need to make sure the device class created first, we need to
