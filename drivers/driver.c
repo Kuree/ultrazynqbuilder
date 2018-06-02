@@ -392,11 +392,8 @@ int process_image(struct hwacc_drvdata *drvdata, Buffer *buf_list)
   for (i = 0; i < drvdata->nr_channels; i++) {
     chan = drvdata->chan[i];
     buf = &buf_list[i];
-    if (chan->input_chan) {
-      if (buf->width != 170 || buf->height != 170 || buf->depth != 3) {
-        ERROR("Buffer size for input %d doesn't match hardware!", i);
-      }
-    }
+    DEBUG("chan index: %d width: %d heigh: %d depth: %d\n", i, buf->width,
+          buf->height, buf->depth);
   }
 
   TRACE("process_image: begin\n");
@@ -871,6 +868,7 @@ static int init_dma(struct hwacc_drvdata *drvdata)
             retval = -ENXIO;
             goto failed0;
         }
+
         of_node_put(dma_node);
         return 0;
 

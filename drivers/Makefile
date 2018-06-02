@@ -6,7 +6,6 @@ PWD := `pwd`
 #   cmabuffer - Provides access to large contiguous memory buffers from Linux CMA
 #   hwacc - Driver for hardware accelerator, using one or more DMA engines
 obj-m := hwacc.o cmabuffer.o
-ccflags-y := -Wall
 
 # Dependencies for each of the modules
 # Note that some code related to buffer handling and ioctl numbers is shared
